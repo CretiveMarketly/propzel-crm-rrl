@@ -5113,6 +5113,9 @@ async def marketly_v2_request(kind: str, settings: dict, payload: dict) -> dict:
 
 
 def _evolution_instance(settings: dict) -> str:
+    personal_instance = str(settings.get("_evolution_instance_override") or "").strip()
+    if personal_instance:
+        return personal_instance
     organization_id = str(settings.get("organization_id") or "").strip()
     if organization_id:
         prefix = re.sub(r"[^a-z0-9]", "", os.environ.get("EVOLUTION_INSTANCE_NAME", "rrl").lower())[:18] or "rrl"
@@ -5138,7 +5141,7 @@ async def whatsapp_settings_for_actor(organization_id: Optional[str], actor: dic
         # rejects because that instance has never been created or paired.
         personal_instance = str(actor.get("whatsapp_evolution_instance") or "").strip()
         if personal_instance:
-            settings["evolution_instance_name"] = personal_instance
+            settings["_evolution_instance_override"] = personal_instance
     return settings
 
 
@@ -5411,8 +5414,11 @@ async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin", "manager"
         result = await evolution_request("GET", f"/instance/connect/{instance}", settings)
         # Evolution returns the scan image as `base64`; preserve the provider
         # response but expose the existing CRM UI's expected field as well.
-        if isinstance(result, dict) and result.get("base64") and not result.get("qrcode"):
-            result["qrcode"] = result["base64"]
+        if isinstance(result, dict) and not result.get("qrcode"):
+            nested = result.get("data") if isinstance(result.get("data"), dict) else {}
+            encoded_qr = result.get("base64") or nested.get("base64") or nested.get("qrcode")
+            if encoded_qr:
+                result["qrcode"] = encoded_qr
         return result
     result = await whatsapp_service_request("get_qrcode", settings)
     message = str(result.get("message") or result.get("error") or "") if isinstance(result, dict) else ""
