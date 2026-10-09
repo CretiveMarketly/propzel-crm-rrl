@@ -4798,10 +4798,6 @@ def _whatsapp_webhook_url() -> str:
         return configured.rstrip("/")
     if BACKEND_PUBLIC_URL.startswith("https://"):
         return f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/whatsapp/webhook"
-    # Vercel may not expose BACKEND_PUBLIC_URL in every environment, but this
-    # is the stable production alias registered with the WhatsApp provider.
-    if os.environ.get("VERCEL"):
-        return "https://taskko-crm-server.vercel.app/api/whatsapp/webhook"
     return f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/whatsapp/webhook" if BACKEND_PUBLIC_URL else ""
 
 
@@ -4901,6 +4897,18 @@ def _evolution_inbound_message(payload) -> Optional[dict]:
         "filename": media.get("fileName") or media.get("filename"),
         "mimetype": media.get("mimetype"),
     }
+
+
+def _evolution_message_status(payload) -> Optional[tuple[str, str]]:
+    event = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else payload
+    if not isinstance(event, dict):
+        return None
+    key = event.get("key") if isinstance(event.get("key"), dict) else {}
+    message_id = key.get("id") or event.get("messageId") or event.get("message_id")
+    status_value = event.get("status") or event.get("messageStatus") or event.get("statusMessage")
+    if not message_id or not status_value:
+        return None
+    return str(message_id), str(status_value).lower()
 
 
 def _extract_whatsapp_message_id(payload: dict) -> Optional[str]:
@@ -5105,6 +5113,10 @@ async def marketly_v2_request(kind: str, settings: dict, payload: dict) -> dict:
 
 
 def _evolution_instance(settings: dict) -> str:
+    organization_id = str(settings.get("organization_id") or "").strip()
+    if organization_id:
+        prefix = re.sub(r"[^a-z0-9]", "", os.environ.get("EVOLUTION_INSTANCE_NAME", "rrl").lower())[:18] or "rrl"
+        return f"{prefix}_{re.sub(r'[^a-z0-9]', '', organization_id.lower())[:16]}"
     return str(settings.get("evolution_instance_name") or settings.get("whatsapp_instance_id") or "").strip()
 
 
@@ -5114,7 +5126,7 @@ def _executive_evolution_instance(actor: dict, organization_id: Optional[str]) -
         return saved
     organization_part = re.sub(r"[^A-Za-z0-9]", "", str(organization_id or "org"))[:12] or "org"
     user_part = re.sub(r"[^A-Za-z0-9]", "", str(actor.get("id") or "user"))[:12] or "user"
-    return f"propzel_{organization_part}_{user_part}"
+    return f"rrl_{organization_part}_{user_part}"
 
 
 async def whatsapp_settings_for_actor(organization_id: Optional[str], actor: dict) -> dict:
@@ -5134,6 +5146,13 @@ def _evolution_connection_state(response: dict) -> str:
     instance = response.get("instance") if isinstance(response, dict) else None
     raw_state = (instance or {}).get("state") if isinstance(instance, dict) else None
     return str(raw_state or (response.get("state") if isinstance(response, dict) else "") or "unknown").lower()
+
+
+def _evolution_provider_message_id(response: dict) -> Optional[str]:
+    if not isinstance(response, dict):
+        return None
+    key = response.get("key") or (response.get("data") or {}).get("key")
+    return str(key.get("id")) if isinstance(key, dict) and key.get("id") else None
 
 
 async def evolution_request(method: str, path: str, settings: dict, payload: Optional[dict] = None, timeout: int = 90) -> dict:
@@ -5228,6 +5247,7 @@ async def create_whatsapp_message_for_lead(lead: dict, body: WhatsAppSendBody, a
         "text": body.text,
         "template_id": body.template_id,
         "provider_status": provider_result.get("status"),
+        "provider_message_id": _evolution_provider_message_id(provider_result),
         "provider_response": provider_result,
         "created_at": now,
     }
@@ -5317,7 +5337,7 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin", "manager
             raise HTTPException(status_code=502, detail=state.get("message") or "Could not prepare the WhatsApp connection")
         webhook_path = f"{organization_id}/{actor['id']}" if personal_executive_account else str(organization_id or "")
         webhook_url = f"{_whatsapp_webhook_url().rstrip('/')}/{webhook_path}" if _whatsapp_webhook_url() and webhook_path else ""
-        webhook = await evolution_request("POST", f"/webhook/set/{instance}", settings, {"webhook": {"enabled": True, "url": webhook_url, "webhook_by_events": False, "webhook_base64": True, "events": ["MESSAGES_UPSERT"]}}) if webhook_url else None
+        webhook = await evolution_request("POST", f"/webhook/set/{instance}", settings, {"webhook": {"enabled": True, "url": webhook_url, "webhook_by_events": False, "webhook_base64": True, "events": ["MESSAGES_UPSERT", "MESSAGES_UPDATE"]}}) if webhook_url else None
         if personal_executive_account:
             await db.users.update_one({"id": actor["id"], **organization_scope(actor)}, {"$set": {"whatsapp_evolution_instance": instance}})
         return {"status": "ready", "instance_id": instance if actor.get("role") == "super_admin" else None, "connection_state": _evolution_connection_state(state), "provider": state, "webhook": webhook}
@@ -5586,7 +5606,7 @@ async def send_whatsapp_media(body: WhatsAppMediaSendBody, actor: dict = Depends
         "id": new_id(), "organization_id": lead.get("organization_id"), "conversation_id": conv["id"], "lead_id": lead["id"],
         "direction": "outgoing", "sender_id": actor.get("id"), "sender_name": actor.get("name"),
         "message_type": body.media_type, "text": body.caption or "", "media_url": body.media_url,
-        "filename": body.filename, "provider_status": provider.get("status"),
+        "filename": body.filename, "provider_status": provider.get("status"), "provider_message_id": _evolution_provider_message_id(provider),
         "provider_response": provider, "created_at": now,
     }
     await db.whatsapp_messages.insert_one(msg)
@@ -5674,7 +5694,7 @@ async def _send_whatsapp_attachment(conv: dict, lead: dict, file: UploadFile, ca
     if provider.get("status") in {"provider_error", "pending_credentials"}:
         raise HTTPException(status_code=502, detail=provider.get("message") or "WhatsApp provider could not send the attachment")
     now = now_utc().isoformat()
-    message = {"id": new_id(), "organization_id": lead.get("organization_id"), "conversation_id": conv["id"], "lead_id": lead["id"], "direction": "outgoing", "sender_id": actor["id"], "sender_name": actor.get("name"), "message_type": message_type, "text": caption.strip(), "filename": filename, "mimetype": mime, "provider_status": provider.get("status"), "provider_response": provider, "created_at": now}
+    message = {"id": new_id(), "organization_id": lead.get("organization_id"), "conversation_id": conv["id"], "lead_id": lead["id"], "direction": "outgoing", "sender_id": actor["id"], "sender_name": actor.get("name"), "message_type": message_type, "text": caption.strip(), "filename": filename, "mimetype": mime, "provider_status": provider.get("status"), "provider_message_id": _evolution_provider_message_id(provider), "provider_response": provider, "created_at": now}
     await db.whatsapp_messages.insert_one(message)
     await db.whatsapp_conversations.update_one({"id": conv["id"], "organization_id": lead.get("organization_id")}, {"$set": {"last_message": caption.strip() or f"[{filename}]", "last_message_at": now, "updated_at": now}})
     clean(message)
@@ -5704,6 +5724,15 @@ async def whatsapp_webhook(request: Request, organization_id: Optional[str] = No
         payload = await request.json()
     else:
         payload = dict(await request.form())
+    event_name = str(payload.get("event") or payload.get("type") or "").upper() if isinstance(payload, dict) else ""
+    status_update = _evolution_message_status(payload)
+    if event_name == "MESSAGES_UPDATE" and status_update:
+        provider_message_id, provider_status = status_update
+        result = await db.whatsapp_messages.update_one(
+            {"organization_id": organization_id, "provider_message_id": provider_message_id},
+            {"$set": {"provider_status": provider_status, "provider_status_updated_at": now_utc().isoformat()}},
+        )
+        return {"ok": True, "status_updated": bool(result.matched_count)}
     evolution_message = _evolution_inbound_message(payload)
     payload = _coerce_whatsapp_payload(payload)
 
@@ -8446,6 +8475,7 @@ async def on_startup():
             db.notifications.create_index([("user_id", 1), ("created_at", -1)]),
             db.notifications.create_index([("role_scope", 1), ("created_at", -1)]),
             db.notifications.create_index("dedupe_key"),
+            db.whatsapp_messages.create_index([("organization_id", 1), ("provider_message_id", 1)]),
             db.google_calendar_connections.create_index([("user_id", 1), ("organization_id", 1)], unique=True),
             db.google_calendar_oauth_states.create_index("state_hash", unique=True),
             db.google_calendar_oauth_states.create_index("expires_at", expireAfterSeconds=0),
