@@ -3978,7 +3978,7 @@ def calendar_event(visit, lead):
     start = datetime.fromisoformat(str(visit["scheduled_at"]).replace("Z", "+00:00"))
     text = ["Propzel CRM site visit", f"Visit ID: {visit['id']}", f"Lead: {lead.get('name', 'Unknown')}"]
     if visit.get("notes"): text.append(f"Notes: {visit['notes']}")
-    return {"summary": f"Site visit: {lead.get('name', 'Lead')}", "description": "\n".join(text), "start": {"dateTime": start.isoformat(), "timeZone": "UTC"}, "end": {"dateTime": (start + timedelta(hours=1)).isoformat(), "timeZone": "UTC"}}
+    return {"summary": f"Site visit: {lead.get('name', 'Lead')}", "description": "\n".join(text), "start": {"dateTime": start.isoformat(), "timeZone": "UTC"}, "end": {"dateTime": (start + timedelta(hours=1)).isoformat(), "timeZone": "UTC"}, "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 30}, {"method": "email", "minutes": 60}]}}
 
 def calendar_service(token, cfg):
     credentials = GoogleOAuthCredentials(token=None, refresh_token=token, token_uri="https://oauth2.googleapis.com/token", client_id=cfg["GOOGLE_CLIENT_ID"], client_secret=cfg["GOOGLE_CLIENT_SECRET"], scopes=[GOOGLE_CALENDAR_SCOPE])
@@ -4165,6 +4165,8 @@ async def create_followup(body: FollowUpBody, actor: dict = Depends(get_current_
     doc["created_at"] = now_utc().isoformat()
     if not doc.get("assigned_to"):
         doc["assigned_to"] = lead.get("assigned_to")
+    if body.kind == "call":
+        doc["meta"] = {"auto": True, "auto_dial": True}
     await db.follow_ups.insert_one(doc)
     doc.pop("_id", None)
     await log_activity(doc["lead_id"], actor, "followup_scheduled", f"Follow-up scheduled at {doc['due_at']}")
@@ -6690,8 +6692,10 @@ async def _save_callerdesk_call(
     now = now_utc().isoformat()
     call_id = new_id()
     organization_id = (lead or {}).get("organization_id") or (actor or {}).get("active_organization_id") or (actor or {}).get("organization_id")
+    existing_call = await db.callerdesk_calls.find_one({"call_sid": call_sid, "organization_id": organization_id}, {"_id": 0}) if call_sid else None
+    recording_url = recording_url or (existing_call or {}).get("recording_url")
     doc = {
-        "id": call_id,
+        "id": (existing_call or {}).get("id") or call_id,
         "provider": "callerdesk",
         "call_sid": call_sid,
         "lead_id": (lead or {}).get("id"),
@@ -6708,11 +6712,16 @@ async def _save_callerdesk_call(
         "campaign_number_id": campaign_number_id,
         "raw": raw or {},
         "organization_id": organization_id,
-        "created_at": now,
+        "created_at": (existing_call or {}).get("created_at") or now,
         "updated_at": now,
     }
     if call_sid:
-        await db.callerdesk_calls.update_one({"call_sid": call_sid, "organization_id": organization_id}, {"$set": doc}, upsert=True)
+        mutable_doc = {key: value for key, value in doc.items() if key not in {"id", "created_at"}}
+        await db.callerdesk_calls.update_one(
+            {"call_sid": call_sid, "organization_id": organization_id},
+            {"$set": mutable_doc, "$setOnInsert": {"id": doc["id"], "created_at": doc["created_at"]}},
+            upsert=True,
+        )
     else:
         await db.callerdesk_calls.insert_one(doc)
 
@@ -7222,12 +7231,15 @@ async def callerdesk_webhook(request: Request):
     if secret and payload.get("secret") != secret and request.headers.get("X-CallerDesk-Secret") != secret:
         return StarletteResponse(status_code=403)
     call_sid = payload.get("sid_id") or payload.get("call_sid") or payload.get("CallSid") or payload.get("id")
-    duration = int(payload.get("talk_duration") or payload.get("total_duration") or payload.get("CallDuration") or payload.get("duration") or 0)
+    try:
+        duration = int(float(_extract_callerdesk_value(payload, {"talk_duration", "total_duration", "CallDuration", "duration"}, 0) or 0))
+    except (TypeError, ValueError):
+        duration = 0
     status_text = _normalize_call_status(payload.get("callstatus") or payload.get("status") or payload.get("Status"), duration)
     direction = "outgoing" if str(payload.get("callresult") or payload.get("Flow_type") or "").upper() in {"WEBOBD", "CLICK-TO-CALL", "CLICK_TO_CALL"} else (payload.get("direction") or "incoming")
     phone_from = payload.get("caller_num") or payload.get("caller_number") or payload.get("from") or payload.get("From")
     phone_to = payload.get("member_num") or payload.get("destination_number") or payload.get("to") or payload.get("To")
-    recording_url = payload.get("file") or payload.get("recording_url") or payload.get("RecordingUrl")
+    recording_url = _extract_callerdesk_value(payload, {"file", "recording_url", "recordingurl", "recording_file", "recording_link", "audio_url"})
 
     call = await db.callerdesk_calls.find_one({"call_sid": call_sid, "organization_id": organization_id}) if call_sid else None
     lead = await db.leads.find_one({"id": call.get("lead_id"), "organization_id": organization_id}, {"_id": 0}) if call and call.get("lead_id") else None
@@ -8081,7 +8093,7 @@ async def admin_eod_email_send(user: dict = Depends(require_roles("admin"))):
     return await send_eod_email_to_admins()
 
 
-@api.post("/jobs/process-due-call-followups")
+@api.api_route("/jobs/process-due-call-followups", methods=["GET", "POST"])
 async def process_due_call_followups_job(request: Request):
     """Protected scheduler target for serverless deployments."""
     cron_secret = os.environ.get("CRON_SECRET", "")
@@ -8491,11 +8503,13 @@ async def on_startup():
         log.warning(f"index setup: {e}")
 
     # Production and developer environments must never silently repopulate a
-    # cleaned CRM with sample records.  Demo fixtures are opt-in only.
+    # cleaned CRM with sample records. Demo fixtures are opt-in only.
     if not os.environ.get("VERCEL") and os.environ.get("SEED_DEMO_DATA", "").lower() == "true":
         await seed_demo()
 
-        # Scheduler: EOD email at IST 18:00; notif refresh every 15 minutes
+    # Vercel uses its protected Cron endpoint; run APScheduler only in a
+    # persistent process, regardless of whether demo fixtures are enabled.
+    if not os.environ.get("VERCEL"):
         try:
             eod_hour = int(os.environ.get("EOD_HOUR_IST", "18"))
             eod_min = int(os.environ.get("EOD_MIN_IST", "0"))
