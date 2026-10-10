@@ -6561,7 +6561,18 @@ async def report_sources(start: Optional[str] = None, end: Optional[str] = None,
 # ---------------------------------------------------------------------------
 from fastapi.responses import Response as StarletteResponse  # noqa: E402
 
-BACKEND_PUBLIC_URL = os.environ.get("BACKEND_PUBLIC_URL", "")
+BACKEND_PUBLIC_URL = os.environ.get("BACKEND_PUBLIC_URL", "").strip().rstrip("/")
+if os.environ.get("VERCEL"):
+    configured_host = urllib.parse.urlsplit(BACKEND_PUBLIC_URL).hostname
+    if configured_host in {"localhost", "127.0.0.1", "::1"}:
+        vercel_host = (
+            os.environ.get("VERCEL_PROJECT_PRODUCTION_URL")
+            or os.environ.get("VERCEL_URL")
+            or ""
+        ).strip().rstrip("/")
+        BACKEND_PUBLIC_URL = (
+            vercel_host if vercel_host.startswith("https://") else f"https://{vercel_host}"
+        ) if vercel_host else ""
 WHATSAPP_WEBHOOK_URL = os.environ.get("WHATSAPP_WEBHOOK_URL", "").strip()
 
 
