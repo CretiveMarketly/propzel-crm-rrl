@@ -8431,7 +8431,7 @@ async def process_due_call_followups():
         "meta.auto_dial": True,
         "meta.auto_dialed": {"$ne": True}
     }
-    cursor = db.follow_ups.find(query)
+    cursor = db.follow_ups.find(query).sort("due_at", 1).limit(2)
     processed, started, failed = 0, 0, 0
     async for fu in cursor:
         fu_id = fu["id"]
