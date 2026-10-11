@@ -4164,7 +4164,11 @@ async def create_followup(body: FollowUpBody, actor: dict = Depends(get_current_
     doc["due_at"] = doc["due_at"].astimezone(timezone.utc).isoformat()
     doc["created_at"] = now_utc().isoformat()
     if not doc.get("assigned_to"):
-        doc["assigned_to"] = lead.get("assigned_to")
+        if body.kind == "call":
+            # Manual click-to-call uses the scheduler's CallerDesk phone.
+            doc["assigned_to"] = actor.get("id") or lead.get("assigned_to")
+        else:
+            doc["assigned_to"] = lead.get("assigned_to") or actor.get("id")
     if body.kind == "call":
         doc["meta"] = {"auto": True, "auto_dial": True}
     await db.follow_ups.insert_one(doc)
