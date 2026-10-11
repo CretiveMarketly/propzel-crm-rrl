@@ -6800,13 +6800,25 @@ async def _find_or_create_inbound_callerdesk_lead(phone: Optional[str], organiza
     return lead
 
 
-async def _schedule_missed_call_retry(lead: Optional[dict], call_sid: Optional[str], status_text: str) -> None:
+async def _schedule_missed_call_retry(
+    lead: Optional[dict],
+    call_sid: Optional[str],
+    status_text: str,
+    source_followup_id: Optional[str] = None,
+) -> None:
     """Create one follow-up per missed provider call; the due-call job dials it."""
     if not lead:
         return
     organization_id = lead.get("organization_id")
     if not organization_id:
         return
+    if source_followup_id:
+        source_followup = await db.follow_ups.find_one(
+            {"id": source_followup_id, "organization_id": organization_id},
+            {"_id": 0, "meta": 1},
+        )
+        if ((source_followup or {}).get("meta") or {}).get("source_call_sid"):
+            return
     settings = await get_integration_settings(organization_id)
     if not settings.get("missed_call_followup_enabled", True):
         return
@@ -7281,7 +7293,9 @@ async def callerdesk_webhook(request: Request):
             {"$set": {"status": status_text, "duration_sec": duration, "call_sid": call_sid, "updated_at": now_utc().isoformat()}},
         )
     if lead and status_text in {"dnp", "busy", "failed", "missed", "no_answer", "not_answered"}:
-        await _schedule_missed_call_retry(lead, call_sid, status_text)
+        await _schedule_missed_call_retry(
+            lead, call_sid, status_text, (call or {}).get("followup_id")
+        )
     if lead and status_text in {"ringing", "connected", "completed", "answered"}:
         recipients = list(dict.fromkeys([lead.get("assigned_to"), *(lead.get("co_assigned_to") or [])]))
         for recipient in filter(None, recipients):
@@ -8472,6 +8486,23 @@ async def process_due_call_followups():
                 result = await _initiate_call(lead, assignee)
                 meta["auto_dial_result"] = result.get("status", "initiated")
                 await db.follow_ups.update_one({"id": fu_id}, {"$set": {"meta": meta}})
+                call_sid = result.get("call_sid")
+                organization_id = lead.get("organization_id")
+                if call_sid and organization_id:
+                    await db.callerdesk_calls.update_one(
+                        {"call_sid": call_sid, "organization_id": organization_id},
+                        {"$set": {"followup_id": fu_id}},
+                    )
+                    activity = await db.activities.find_one(
+                        {"meta.call_sid": call_sid, "organization_id": organization_id},
+                        {"_id": 0, "id": 1, "meta": 1},
+                    )
+                    if activity:
+                        activity_meta = activity.get("meta") or {}
+                        activity_meta["followup_id"] = fu_id
+                        await db.activities.update_one(
+                            {"id": activity["id"]}, {"$set": {"meta": activity_meta}}
+                        )
                 started += 1
             except Exception as e:
                 log.warning(f"Failed to auto-dial follow-up {fu_id}: {e}")
