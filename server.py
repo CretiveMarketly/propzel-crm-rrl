@@ -6673,9 +6673,11 @@ def _extract_callerdesk_sid(resp: dict) -> Optional[str]:
 def _extract_callerdesk_value(resp: dict, keys: set[str], default=None):
     if not isinstance(resp, (dict, list)):
         return default
+    normalized_keys = {re.sub(r"[^a-z0-9]", "", str(key).casefold()) for key in keys}
     if isinstance(resp, dict):
         for key, value in resp.items():
-            if str(key).lower() in keys and value not in (None, ""):
+            normalized_key = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+            if normalized_key in normalized_keys and value not in (None, ""):
                 return value
         for value in resp.values():
             found = _extract_callerdesk_value(value, keys, None)
@@ -6687,6 +6689,15 @@ def _extract_callerdesk_value(resp: dict, keys: set[str], default=None):
             if found is not None:
                 return found
     return default
+
+
+def _callerdesk_recording_url(call: dict) -> Optional[str]:
+    if call.get("recording_url"):
+        return call["recording_url"]
+    return _extract_callerdesk_value(call.get("raw") or {}, {
+        "file", "recording_url", "recordingurl", "recording_file", "recording_link",
+        "audio_url", "CallRecordingUrl",
+    })
 
 
 async def _save_callerdesk_call(
@@ -6989,6 +7000,15 @@ def _callerdesk_filter_query(
 
 def _mask_call_row(row: dict, user: dict) -> dict:
     row.pop("_id", None)
+    row["recording_url"] = _callerdesk_recording_url(row)
+    if not row.get("duration_sec"):
+        raw_duration = _extract_callerdesk_value(row.get("raw") or {}, {"TalkDuration"})
+        if raw_duration in (None, ""):
+            raw_duration = _extract_callerdesk_value(row.get("raw") or {}, {"CallDuration"})
+        try:
+            row["duration_sec"] = int(float(raw_duration or 0))
+        except (TypeError, ValueError):
+            pass
     if user.get("role") != "super_admin":
         row["phone_from"] = mask_phone(row.get("phone_from"))
         row["phone_to"] = mask_phone(row.get("phone_to"))
@@ -7220,12 +7240,12 @@ async def callerdesk_campaign_calls(
     if call_sids:
         recording_rows = await db.callerdesk_calls.find(
             {**organization_scope(user), "call_sid": {"$in": call_sids}},
-            {"_id": 0, "call_sid": 1, "recording_url": 1},
+            {"_id": 0, "call_sid": 1, "recording_url": 1, "raw": 1},
         ).to_list(len(call_sids))
         recordings_by_sid = {
-            row["call_sid"]: row.get("recording_url")
+            row["call_sid"]: _callerdesk_recording_url(row)
             for row in recording_rows
-            if row.get("call_sid") and row.get("recording_url")
+            if row.get("call_sid") and _callerdesk_recording_url(row)
         }
     for row in rows:
         row["recording_url"] = recordings_by_sid.get(row.get("call_sid"))
@@ -7239,7 +7259,10 @@ async def _callerdesk_organization_from_payload(payload: dict) -> Optional[str]:
     """Resolve an inbound webhook to one organisation by its configured DID."""
     candidates = {
         _phone_digits(payload.get(key), last10=True)
-        for key in ("deskphone", "virtual_number", "member_num", "destination_number", "to", "To", "callerid")
+        for key in (
+            "deskphone", "virtual_number", "member_num", "destination_number",
+            "DestinationNumber", "to", "To", "callerid", "DialWhomNumber",
+        )
         if payload.get(key)
     }
     candidates.discard("")
@@ -7271,16 +7294,23 @@ async def callerdesk_webhook(request: Request):
     secret = settings.get("callerdesk_webhook_secret")
     if secret and payload.get("secret") != secret and request.headers.get("X-CallerDesk-Secret") != secret:
         return StarletteResponse(status_code=403)
-    call_sid = payload.get("sid_id") or payload.get("call_sid") or payload.get("CallSid") or payload.get("id")
+    call_sid = _extract_callerdesk_value(payload, {"sid_id", "call_sid", "CallSid"}) or payload.get("id")
     try:
-        duration = int(float(_extract_callerdesk_value(payload, {"talk_duration", "total_duration", "CallDuration", "duration"}, 0) or 0))
+        duration_value = _extract_callerdesk_value(payload, {"TalkDuration"})
+        if duration_value in (None, ""):
+            duration_value = _extract_callerdesk_value(payload, {"CallDuration", "total_duration", "duration"}, 0)
+        duration = int(float(duration_value or 0))
     except (TypeError, ValueError):
         duration = 0
-    status_text = _normalize_call_status(payload.get("callstatus") or payload.get("status") or payload.get("Status"), duration)
-    direction = "outgoing" if str(payload.get("callresult") or payload.get("Flow_type") or "").upper() in {"WEBOBD", "CLICK-TO-CALL", "CLICK_TO_CALL"} else (payload.get("direction") or "incoming")
-    phone_from = payload.get("caller_num") or payload.get("caller_number") or payload.get("from") or payload.get("From")
-    phone_to = payload.get("member_num") or payload.get("destination_number") or payload.get("to") or payload.get("To")
-    recording_url = _extract_callerdesk_value(payload, {"file", "recording_url", "recordingurl", "recording_file", "recording_link", "audio_url"})
+    status_text = _normalize_call_status(_extract_callerdesk_value(payload, {"callstatus", "status"}), duration)
+    raw_direction = str(_extract_callerdesk_value(payload, {"callresult", "Flow_type", "Direction", "direction"}, "") or "").upper()
+    direction = "outgoing" if raw_direction in {"WEBOBD", "CLICK-TO-CALL", "CLICK_TO_CALL", "OUTGOING"} else "incoming"
+    phone_from = _extract_callerdesk_value(payload, {"caller_num", "caller_number", "from", "SourceNumber"})
+    phone_to = _extract_callerdesk_value(payload, {"member_num", "destination_number", "to", "DestinationNumber", "DialWhomNumber"})
+    recording_url = _extract_callerdesk_value(payload, {
+        "file", "recording_url", "recordingurl", "recording_file", "recording_link",
+        "audio_url", "CallRecordingUrl",
+    })
 
     call = await db.callerdesk_calls.find_one({"call_sid": call_sid, "organization_id": organization_id}) if call_sid else None
     lead = await db.leads.find_one({"id": call.get("lead_id"), "organization_id": organization_id}, {"_id": 0}) if call and call.get("lead_id") else None
