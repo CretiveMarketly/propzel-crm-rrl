@@ -7215,6 +7215,20 @@ async def callerdesk_campaign_calls(
         if date_from: q["created_at"]["$gte"] = date_from
         if date_to: q["created_at"]["$lte"] = f"{date_to}T23:59:59.999999+00:00" if len(date_to) == 10 else date_to
     rows = await db.callerdesk_campaign_numbers.find(q, {"_id": 0}).sort("created_at", -1).limit(500).to_list(500)
+    call_sids = list({row.get("call_sid") for row in rows if row.get("call_sid")})
+    recordings_by_sid = {}
+    if call_sids:
+        recording_rows = await db.callerdesk_calls.find(
+            {**organization_scope(user), "call_sid": {"$in": call_sids}},
+            {"_id": 0, "call_sid": 1, "recording_url": 1},
+        ).to_list(len(call_sids))
+        recordings_by_sid = {
+            row["call_sid"]: row.get("recording_url")
+            for row in recording_rows
+            if row.get("call_sid") and row.get("recording_url")
+        }
+    for row in rows:
+        row["recording_url"] = recordings_by_sid.get(row.get("call_sid"))
     if user.get("role") != "super_admin":
         for row in rows:
             row["phone"] = mask_phone(row.get("phone"))
