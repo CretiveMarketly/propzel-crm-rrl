@@ -4240,6 +4240,19 @@ async def list_activities(lead_id: Optional[str] = None, limit: int = 50, user: 
             {"user_id": user["id"]},
         ]
     docs = await db.activities.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    sids = list({(d.get("meta") or {}).get("call_sid") for d in docs if (d.get("meta") or {}).get("provider") == "callerdesk" and (d.get("meta") or {}).get("call_sid")})
+    if sids:
+        calls = await db.callerdesk_calls.find(
+            {**organization_scope(user), "call_sid": {"$in": sids}}, {"_id": 0}
+        ).to_list(len(sids))
+        by_sid = {c["call_sid"]: c for c in calls}
+        for doc in docs:
+            meta = doc.get("meta") or {}
+            call = by_sid.get(meta.get("call_sid")) if meta.get("provider") == "callerdesk" else None
+            if call:
+                meta["recording_url"] = _callerdesk_recording_url(call) or meta.get("recording_url")
+                meta["duration_sec"] = max(_callerdesk_duration(call), _callerdesk_duration(meta))
+                doc["message"] = f"CallerDesk call {call.get('status') or meta.get('status') or 'unknown'} · {meta['duration_sec']}s"
     return [sanitize_activity_doc(d, user) for d in docs]
 
 
@@ -6649,6 +6662,9 @@ async def _callerdesk_api_request(method: str, endpoint: str, settings: dict, pa
 
 def _extract_callerdesk_sid(resp: dict) -> Optional[str]:
     """Find the provider call identifier in any response nesting shape."""
+    call_sid = _extract_callerdesk_value(resp, {"sid_id", "call_sid", "callsid", "sid", "call_id", "callid", "provider_call_id"})
+    if call_sid not in (None, ""):
+        return str(call_sid)
     sid_keys = {"sid_id", "call_sid", "callsid", "sid", "call_id", "callid", "provider_call_id", "campid", "campaign_id"}
 
     def walk(value):
@@ -6700,6 +6716,29 @@ def _callerdesk_recording_url(call: dict) -> Optional[str]:
     })
 
 
+def _callerdesk_duration(call: dict) -> int:
+    """Read seconds or a clock duration without turning malformed values into errors."""
+    def seconds(value):
+        try:
+            parts = str(value).strip().split(":")
+            if len(parts) > 3:
+                return 0
+            total = 0.0
+            for part in parts:
+                total = total * 60 + float(part)
+            return max(0, int(total))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    saved = seconds(call.get("duration_sec"))
+    raw = call.get("raw") or {}
+    talk = _extract_callerdesk_value(raw, {"TalkDuration", "talk_time", "talktime", "conversation_duration"})
+    # An explicit zero talk duration is meaningful for unanswered calls.
+    if talk not in (None, ""):
+        return max(saved, seconds(talk))
+    return max(saved, seconds(_extract_callerdesk_value(raw, {"CallDuration", "total_duration", "duration"})))
+
+
 async def _save_callerdesk_call(
     lead: Optional[dict],
     actor: Optional[dict],
@@ -6714,20 +6753,32 @@ async def _save_callerdesk_call(
     campaign_id: Optional[str] = None,
     campaign_number_id: Optional[str] = None,
     raw: Optional[dict] = None,
+    organization_id: Optional[str] = None,
 ) -> str:
     now = now_utc().isoformat()
     call_id = new_id()
-    organization_id = (lead or {}).get("organization_id") or (actor or {}).get("active_organization_id") or (actor or {}).get("organization_id")
+    organization_id = organization_id or (lead or {}).get("organization_id") or (actor or {}).get("active_organization_id") or (actor or {}).get("organization_id")
+    call_sid = str(call_sid) if call_sid not in (None, "") else None
     existing_call = await db.callerdesk_calls.find_one({"call_sid": call_sid, "organization_id": organization_id}, {"_id": 0}) if call_sid else None
-    recording_url = recording_url or (existing_call or {}).get("recording_url")
+    previous = existing_call or {}
+    duration_sec = max(_callerdesk_duration(previous), _callerdesk_duration({"duration_sec": duration_sec, "raw": raw}))
+    recording_url = recording_url or _callerdesk_recording_url(previous)
+    if previous.get("status") and status_text in {"initiated", "queued", "ringing", "in_progress", "dialing"}:
+        if previous["status"] in {"connected", "dnp", "busy", "failed", "completed"}:
+            status_text = previous["status"]
+    direction = previous.get("direction") or direction
+    phone_from = phone_from or previous.get("phone_from")
+    phone_to = phone_to or previous.get("phone_to")
+    campaign_id = campaign_id or previous.get("campaign_id")
+    campaign_number_id = campaign_number_id or previous.get("campaign_number_id")
     doc = {
         "id": (existing_call or {}).get("id") or call_id,
         "provider": "callerdesk",
         "call_sid": call_sid,
-        "lead_id": (lead or {}).get("id"),
-        "lead_name": (lead or {}).get("name"),
-        "actor_id": (actor or {}).get("id"),
-        "actor_name": (actor or {}).get("name") or "system",
+        "lead_id": (lead or {}).get("id") or previous.get("lead_id"),
+        "lead_name": (lead or {}).get("name") or previous.get("lead_name"),
+        "actor_id": (actor or {}).get("id") or previous.get("actor_id"),
+        "actor_name": (actor or {}).get("name") or previous.get("actor_name") or "system",
         "direction": direction,
         "status": status_text,
         "duration_sec": duration_sec,
@@ -6736,7 +6787,7 @@ async def _save_callerdesk_call(
         "recording_url": recording_url,
         "campaign_id": campaign_id,
         "campaign_number_id": campaign_number_id,
-        "raw": raw or {},
+        "raw": {**(previous.get("raw") or {}), **(raw or {})},
         "organization_id": organization_id,
         "created_at": (existing_call or {}).get("created_at") or now,
         "updated_at": now,
@@ -6780,7 +6831,7 @@ async def _save_callerdesk_call(
                 await db.activities.insert_one({"id": new_id(), **activity, "created_at": now})
         else:
             await db.activities.insert_one({"id": new_id(), **activity, "created_at": now})
-    return call_id
+    return doc["id"]
 
 
 async def _find_or_create_inbound_callerdesk_lead(phone: Optional[str], organization_id: str) -> Optional[dict]:
@@ -7001,14 +7052,7 @@ def _callerdesk_filter_query(
 def _mask_call_row(row: dict, user: dict) -> dict:
     row.pop("_id", None)
     row["recording_url"] = _callerdesk_recording_url(row)
-    if not row.get("duration_sec"):
-        raw_duration = _extract_callerdesk_value(row.get("raw") or {}, {"TalkDuration"})
-        if raw_duration in (None, ""):
-            raw_duration = _extract_callerdesk_value(row.get("raw") or {}, {"CallDuration"})
-        try:
-            row["duration_sec"] = int(float(raw_duration or 0))
-        except (TypeError, ValueError):
-            pass
+    row["duration_sec"] = _callerdesk_duration(row)
     if user.get("role") != "super_admin":
         row["phone_from"] = mask_phone(row.get("phone_from"))
         row["phone_to"] = mask_phone(row.get("phone_to"))
@@ -7240,15 +7284,18 @@ async def callerdesk_campaign_calls(
     if call_sids:
         recording_rows = await db.callerdesk_calls.find(
             {**organization_scope(user), "call_sid": {"$in": call_sids}},
-            {"_id": 0, "call_sid": 1, "recording_url": 1, "raw": 1},
+            {"_id": 0, "call_sid": 1, "recording_url": 1, "duration_sec": 1, "status": 1, "raw": 1},
         ).to_list(len(call_sids))
         recordings_by_sid = {
-            row["call_sid"]: _callerdesk_recording_url(row)
+            row["call_sid"]: row
             for row in recording_rows
-            if row.get("call_sid") and _callerdesk_recording_url(row)
+            if row.get("call_sid")
         }
     for row in rows:
-        row["recording_url"] = recordings_by_sid.get(row.get("call_sid"))
+        call = recordings_by_sid.get(row.get("call_sid")) or {}
+        row["recording_url"] = _callerdesk_recording_url(call) or row.get("recording_url")
+        row["duration_sec"] = max(_callerdesk_duration(row), _callerdesk_duration(call))
+        row["status"] = call.get("status") or row.get("status")
     if user.get("role") != "super_admin":
         for row in rows:
             row["phone"] = mask_phone(row.get("phone"))
@@ -7258,12 +7305,12 @@ async def callerdesk_campaign_calls(
 async def _callerdesk_organization_from_payload(payload: dict) -> Optional[str]:
     """Resolve an inbound webhook to one organisation by its configured DID."""
     candidates = {
-        _phone_digits(payload.get(key), last10=True)
+        _phone_digits(_extract_callerdesk_value(payload, {key}), last10=True)
         for key in (
             "deskphone", "virtual_number", "member_num", "destination_number",
             "DestinationNumber", "to", "To", "callerid", "DialWhomNumber",
         )
-        if payload.get(key)
+        if _extract_callerdesk_value(payload, {key})
     }
     candidates.discard("")
     settings = await db.settings.find({"id": {"$regex": "^organization:"}}, {"_id": 0}).to_list(200)
@@ -7294,14 +7341,9 @@ async def callerdesk_webhook(request: Request):
     secret = settings.get("callerdesk_webhook_secret")
     if secret and payload.get("secret") != secret and request.headers.get("X-CallerDesk-Secret") != secret:
         return StarletteResponse(status_code=403)
-    call_sid = _extract_callerdesk_value(payload, {"sid_id", "call_sid", "CallSid"}) or payload.get("id")
-    try:
-        duration_value = _extract_callerdesk_value(payload, {"TalkDuration"})
-        if duration_value in (None, ""):
-            duration_value = _extract_callerdesk_value(payload, {"CallDuration", "total_duration", "duration"}, 0)
-        duration = int(float(duration_value or 0))
-    except (TypeError, ValueError):
-        duration = 0
+    call_sid = _extract_callerdesk_sid(payload) or payload.get("id")
+    call_sid = str(call_sid) if call_sid not in (None, "") else None
+    duration = _callerdesk_duration({"raw": payload})
     status_text = _normalize_call_status(_extract_callerdesk_value(payload, {"callstatus", "status"}), duration)
     raw_direction = str(_extract_callerdesk_value(payload, {"callresult", "Flow_type", "Direction", "direction"}, "") or "").upper()
     direction = "outgoing" if raw_direction in {"WEBOBD", "CLICK-TO-CALL", "CLICK_TO_CALL", "OUTGOING"} else "incoming"
@@ -7313,6 +7355,12 @@ async def callerdesk_webhook(request: Request):
     })
 
     call = await db.callerdesk_calls.find_one({"call_sid": call_sid, "organization_id": organization_id}) if call_sid else None
+    duration = max(duration, _callerdesk_duration(call or {}))
+    status_text = _normalize_call_status(_extract_callerdesk_value(payload, {"callstatus", "status"}), duration)
+    if call and not _extract_callerdesk_value(payload, {"callstatus", "status"}):
+        status_text = call.get("status") or status_text
+    if call:
+        direction = call.get("direction") or direction
     lead = await db.leads.find_one({"id": call.get("lead_id"), "organization_id": organization_id}, {"_id": 0}) if call and call.get("lead_id") else None
     if not lead and direction != "outgoing":
         lead = await _find_or_create_inbound_callerdesk_lead(phone_from, organization_id)
@@ -7330,6 +7378,7 @@ async def callerdesk_webhook(request: Request):
         campaign_id=(call or {}).get("campaign_id"),
         campaign_number_id=(call or {}).get("campaign_number_id"),
         raw=payload,
+        organization_id=organization_id,
     )
     if call and call.get("campaign_number_id"):
         await db.callerdesk_campaign_numbers.update_one(
