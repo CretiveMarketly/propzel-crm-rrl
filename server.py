@@ -2695,6 +2695,7 @@ import random
 import asyncio
 import base64
 import hashlib
+import mimetypes
 import json
 import csv
 import io
@@ -4891,6 +4892,15 @@ def _evolution_inbound_message(payload) -> Optional[dict]:
     if not isinstance(key, dict) or not isinstance(message, dict):
         return None
 
+    for wrapper in ("ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2", "documentWithCaptionMessage"):
+        if isinstance(message.get(wrapper), dict) and isinstance(message[wrapper].get("message"), dict):
+            message = message[wrapper]["message"]
+    remote = str(key.get("remoteJid") or "")
+    alternate = str(key.get("remoteJidAlt") or "")
+    phone_jid = alternate if alternate.endswith("@s.whatsapp.net") else remote
+    # LIDs and group IDs are not customer phone numbers.
+    phone = phone_jid.split("@", 1)[0].split(":", 1)[0] if phone_jid.endswith("@s.whatsapp.net") else None
+
     media_types = {
         "imageMessage": "image",
         "videoMessage": "video",
@@ -4906,8 +4916,8 @@ def _evolution_inbound_message(payload) -> Optional[dict]:
     text = message.get("conversation") or (message.get("extendedTextMessage") or {}).get("text")
     return {
         "payload": event,
-        "from_me": bool(key.get("fromMe")),
-        "phone": str(key.get("remoteJid") or "").split("@", 1)[0],
+        "from_me": str(key.get("fromMe") or "").lower() in {"true", "1", "yes"},
+        "phone": phone,
         "message_id": str(key.get("id") or "") or None,
         "timestamp": event.get("messageTimestamp"),
         "text": str(text or media.get("caption") or "[WhatsApp message]").strip(),
@@ -4915,6 +4925,7 @@ def _evolution_inbound_message(payload) -> Optional[dict]:
         "media_url": media.get("url") or media.get("mediaUrl"),
         "filename": media.get("fileName") or media.get("filename"),
         "mimetype": media.get("mimetype"),
+        "media_base64": event.get("base64") or message.get("base64") or media.get("base64"),
     }
 
 
@@ -4923,11 +4934,13 @@ def _evolution_message_status(payload) -> Optional[tuple[str, str]]:
     if not isinstance(event, dict):
         return None
     key = event.get("key") if isinstance(event.get("key"), dict) else {}
-    message_id = key.get("id") or event.get("messageId") or event.get("message_id")
-    status_value = event.get("status") or event.get("messageStatus") or event.get("statusMessage")
-    if not message_id or not status_value:
+    message_id = key.get("id") or event.get("keyId") or event.get("messageId") or event.get("message_id")
+    status_value = event.get("status", event.get("messageStatus", event.get("statusMessage")))
+    if not message_id or status_value is None:
         return None
-    return str(message_id), str(status_value).lower()
+    statuses = {"0": "failed", "1": "pending", "2": "sent", "3": "delivered", "4": "read", "5": "played", "server_ack": "sent", "delivery_ack": "delivered", "read": "read", "error": "failed"}
+    status = str(status_value).lower()
+    return str(message_id), statuses.get(status, status)
 
 
 def _extract_whatsapp_message_id(payload: dict) -> Optional[str]:
@@ -4961,7 +4974,7 @@ async def _find_lead_by_phone_digits(phone_digits: str, organization_id: Optiona
         conv_query["organization_id"] = organization_id
     conv = await db.whatsapp_conversations.find_one(conv_query, {"_id": 0}) if chat_id else None
     if conv and conv.get("lead_id"):
-        return await db.leads.find_one({"id": conv["lead_id"]}, {"_id": 0})
+        return await db.leads.find_one({"id": conv["lead_id"], **({"organization_id": organization_id} if organization_id else {})}, {"_id": 0})
     suffix = phone_digits[-10:] if len(phone_digits) >= 10 else phone_digits
     query = {"phone": {"$regex": f"{suffix}$"}}
     if organization_id:
@@ -5056,9 +5069,9 @@ async def ensure_whatsapp_conversation_for_lead(lead: dict, actor: dict) -> dict
     if not chat_id:
         raise HTTPException(status_code=400, detail="Lead has no WhatsApp-capable phone number")
     organization_id = lead.get("organization_id") or organization_scope(actor).get("organization_id")
-    query = {"lead_id": lead["id"], "chat_id": chat_id, "organization_id": organization_id}
-    if actor.get("role") == "executive":
-        query["whatsapp_account_user_id"] = actor["id"]
+    query = {"lead_id": lead["id"], "organization_id": organization_id}
+    personal_account = actor.get("role") == "executive" and actor.get("whatsapp_evolution_instance")
+    query["whatsapp_account_user_id"] = actor["id"] if personal_account else None
     existing = await db.whatsapp_conversations.find_one(query, {"_id": 0})
     if existing:
         return existing
@@ -5078,7 +5091,7 @@ async def ensure_whatsapp_conversation_for_lead(lead: dict, actor: dict) -> dict
         "created_at": now,
         "updated_at": now,
     }
-    if actor.get("role") == "executive":
+    if personal_account:
         doc["whatsapp_account_user_id"] = actor["id"]
     await db.whatsapp_conversations.insert_one(doc)
     doc.pop("_id", None)
@@ -5222,18 +5235,104 @@ async def evolution_request(method: str, path: str, settings: dict, payload: Opt
         return {"status": "provider_error", "message": str(exc)}
 
 
+async def _whatsapp_conversation_context(conversation_id: str, actor: dict) -> tuple[dict, dict]:
+    conv = await db.whatsapp_conversations.find_one({"id": conversation_id, **organization_scope(actor)}, {"_id": 0})
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if actor.get("role") not in {"admin", "manager", "super_admin"} and actor.get("id") not in {conv.get("assigned_to"), conv.get("whatsapp_account_user_id")}:
+        raise HTTPException(status_code=403, detail="Conversation is not assigned to you")
+    lead = await require_lead_access(conv["lead_id"], actor) if conv.get("lead_id") else {
+        "id": None, "organization_id": conv["organization_id"], "phone": conv.get("contact_phone"), "name": conv.get("contact_name"),
+    }
+    return conv, lead
+
+
+async def _whatsapp_settings_for_conversation(conv: dict, actor: dict) -> dict:
+    owner_id = conv.get("whatsapp_account_user_id")
+    settings = await get_integration_settings(conv.get("organization_id"))
+    if owner_id:
+        owner = actor if owner_id == actor.get("id") else await db.users.find_one({"id": owner_id, "organization_id": conv["organization_id"], "active": {"$ne": False}}, {"_id": 0})
+        instance = (owner or {}).get("whatsapp_evolution_instance")
+        if not instance:
+            raise HTTPException(status_code=409, detail="The account owner must reconnect their WhatsApp before sending")
+        settings["_evolution_instance_override"] = instance
+    return settings
+
+
+# Keep multipart requests and binary downloads below Vercel's 4.5 MB limit.
+WHATSAPP_ATTACHMENT_LIMIT = 4 * 1024 * 1024
+
+
+def _without_whatsapp_base64(value):
+    if isinstance(value, dict):
+        return {key: _without_whatsapp_base64(item) for key, item in value.items() if key not in {"base64", "media_base64"}}
+    if isinstance(value, list):
+        return [_without_whatsapp_base64(item) for item in value]
+    return value
+
+
+async def _store_whatsapp_media(message: dict, encoded: Optional[str]) -> bool:
+    if not encoded or not isinstance(encoded, str):
+        return False
+    if encoded.startswith("data:") and "," in encoded:
+        encoded = encoded.split(",", 1)[1]
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError):
+        return False
+    if not content or len(content) > WHATSAPP_ATTACHMENT_LIMIT:
+        return False
+    await db.whatsapp_media.update_one(
+        {"id": message["id"], "organization_id": message["organization_id"]},
+        {"$set": {"content": content, "mimetype": message.get("mimetype") or "application/octet-stream", "filename": message.get("filename") or "attachment"}},
+        upsert=True,
+    )
+    message["media_path"] = f"/whatsapp/messages/{message['id']}/media"
+    return True
+
+
+async def _receive_whatsapp_media(message: dict, event: dict, settings: dict) -> None:
+    if event.get("message_type") not in {"image", "audio", "video", "document"}:
+        return
+    encoded = event.get("media_base64")
+    if not encoded:
+        instance = _evolution_instance(settings)
+        result = await evolution_request("POST", f"/chat/getBase64FromMediaMessage/{instance}", settings, {"message": event["payload"], "convertToMp4": False}, timeout=30)
+        encoded = result.get("base64") or (result.get("data") or {}).get("base64")
+    stored = await _store_whatsapp_media(message, encoded)
+    if stored:
+        # Provider media URLs point to encrypted WhatsApp bytes.
+        message["media_url"] = None
+    else:
+        message["media_url"] = None
+        message["media_error"] = "Attachment unavailable. Files must be 4 MB or smaller."
+
+
+def _whatsapp_message_query(conv: dict) -> dict:
+    # Legacy sent text rows lacked organization_id. The conversation was
+    # already authorized; only recover rows belonging to that exact chat.
+    return {"conversation_id": conv["id"], "$or": [{"organization_id": conv["organization_id"]}, {"organization_id": None}]}
+
+
+async def _list_whatsapp_messages(conv: dict) -> list:
+    rows = await db.whatsapp_messages.find(_whatsapp_message_query(conv), {"_id": 0, "provider_response": 0}).sort("created_at", -1).to_list(500)
+    return list(reversed(rows))
+
+
 async def forward_whatsapp_message(settings: dict, lead: dict, conversation: dict, text: str) -> dict:
-    number = "".join(ch for ch in str(lead.get("phone") or conversation.get("contact_phone") or "") if ch.isdigit())
+    number = str(conversation.get("chat_id") or "").split("@", 1)[0] or "".join(ch for ch in str(lead.get("phone") or conversation.get("contact_phone") or "") if ch.isdigit())
+    if not number:
+        return {"status": "provider_error", "message": "Contact has no WhatsApp phone number"}
     if str(settings.get("whatsapp_provider") or "").lower() == "evolution":
         instance = _evolution_instance(settings)
         if not instance:
             return {"status": "pending_credentials", "message": "Set an Evolution instance name for this organisation"}
-        state = await evolution_request("GET", f"/instance/connectionState/{instance}", settings, timeout=25)
+        state = await evolution_request("GET", f"/instance/connectionState/{instance}", settings, timeout=10)
         if state.get("status") in {"provider_error", "pending_credentials"}:
             return state
         if _evolution_connection_state(state) not in {"open", "connected"}:
             return {"status": "provider_error", "message": "WhatsApp is disconnected. Reconnect the WhatsApp account and scan its QR code before sending messages."}
-        return await evolution_request("POST", f"/message/sendText/{instance}", settings, {"number": number, "text": text, "delay": 0, "linkPreview": True}, timeout=90)
+        return await evolution_request("POST", f"/message/sendText/{instance}", settings, {"number": number, "text": text, "delay": 0, "linkPreview": True}, timeout=35)
     bearer = settings.get("marketly_bearer_token")
     marketly_instance = settings.get("marketly_instance_id") or settings.get("whatsapp_instance_id")
     if bearer and marketly_instance:
@@ -5252,14 +5351,18 @@ async def forward_whatsapp_message(settings: dict, lead: dict, conversation: dic
     return result
 
 
-async def create_whatsapp_message_for_lead(lead: dict, body: WhatsAppSendBody, actor: dict) -> dict:
-    conv = await ensure_whatsapp_conversation_for_lead(lead, actor)
+async def create_whatsapp_message_for_lead(lead: dict, body: WhatsAppSendBody, actor: dict, conversation: Optional[dict] = None) -> dict:
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    conv = conversation or await ensure_whatsapp_conversation_for_lead(lead, actor)
     now = now_utc().isoformat()
-    provider_result = await forward_whatsapp_message(await whatsapp_settings_for_actor(lead.get("organization_id"), actor), lead, conv, body.text)
-    if provider_result.get("status") in {"provider_error", "pending_credentials"}:
+    provider_result = await forward_whatsapp_message(await _whatsapp_settings_for_conversation(conv, actor), lead, conv, body.text)
+    if provider_result.get("status") in {"provider_error", "pending_credentials", "pending_provider", "error", "failed"}:
         raise HTTPException(status_code=502, detail=provider_result.get("message") or "Evolution API could not send the message")
     msg = {
         "id": new_id(),
+        "organization_id": conv["organization_id"],
+        "whatsapp_account_user_id": conv.get("whatsapp_account_user_id"),
         "conversation_id": conv["id"],
         "lead_id": lead["id"],
         "direction": "outgoing",
@@ -5278,7 +5381,8 @@ async def create_whatsapp_message_for_lead(lead: dict, body: WhatsAppSendBody, a
         {"id": conv["id"]},
         {"$set": {"last_message": body.text, "last_message_at": now, "updated_at": now}},
     )
-    await log_activity(lead["id"], actor, "whatsapp", body.text[:200], {"conversation_id": conv["id"], "provider_status": provider_result.get("status")})
+    if lead.get("id"):
+        await log_activity(lead["id"], actor, "whatsapp", body.text[:200], {"conversation_id": conv["id"], "provider_status": provider_result.get("status")})
     clean(msg)
     return {"ok": True, "message": msg, "provider": provider_result, "conversation_id": conv["id"]}
 
@@ -5347,7 +5451,7 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin", "manager
         personal_executive_account = actor.get("role") == "executive"
         if personal_executive_account:
             instance = _executive_evolution_instance(actor, organization_id)
-            settings["evolution_instance_name"] = instance
+            settings["_evolution_instance_override"] = instance
         else:
             instance = _evolution_instance(settings)
         if not instance:
@@ -5359,7 +5463,11 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin", "manager
             raise HTTPException(status_code=502, detail=state.get("message") or "Could not prepare the WhatsApp connection")
         webhook_path = f"{organization_id}/{actor['id']}" if personal_executive_account else str(organization_id or "")
         webhook_url = f"{_whatsapp_webhook_url().rstrip('/')}/{webhook_path}" if _whatsapp_webhook_url() and webhook_path else ""
-        webhook = await evolution_request("POST", f"/webhook/set/{instance}", settings, {"webhook": {"enabled": True, "url": webhook_url, "webhook_by_events": False, "webhook_base64": True, "events": ["MESSAGES_UPSERT", "MESSAGES_UPDATE"]}}) if webhook_url else None
+        if not webhook_url:
+            raise HTTPException(status_code=400, detail="Set BACKEND_PUBLIC_URL to the public backend address before connecting WhatsApp")
+        webhook = await evolution_request("POST", f"/webhook/set/{instance}", settings, {"webhook": {"enabled": True, "url": webhook_url, "webhook_by_events": False, "webhook_base64": False, "events": ["MESSAGES_UPSERT", "MESSAGES_UPDATE"]}})
+        if webhook.get("status") in {"provider_error", "pending_credentials", "error", "failed"}:
+            raise HTTPException(status_code=502, detail=webhook.get("message") or "Could not register the WhatsApp receiving webhook")
         if personal_executive_account:
             await db.users.update_one({"id": actor["id"], **organization_scope(actor)}, {"$set": {"whatsapp_evolution_instance": instance}})
         return {"status": "ready", "instance_id": instance if actor.get("role") == "super_admin" else None, "connection_state": _evolution_connection_state(state), "provider": state, "webhook": webhook}
@@ -5608,7 +5716,7 @@ async def send_whatsapp_media(body: WhatsAppMediaSendBody, actor: dict = Depends
     lead = await require_lead_access(body.lead_id, actor)
     conv = await ensure_whatsapp_conversation_for_lead(lead, actor)
     settings = await whatsapp_settings_for_actor(lead.get("organization_id"), actor)
-    number = "".join(ch for ch in str(lead.get("phone") or conv.get("contact_phone") or "") if ch.isdigit())
+    number = str(conv.get("chat_id") or "").split("@", 1)[0] or "".join(ch for ch in str(lead.get("phone") or conv.get("contact_phone") or "") if ch.isdigit())
     instance_id = settings.get("marketly_instance_id") or settings.get("whatsapp_instance_id")
     payload = {"instance_id": instance_id, "to": number, "media_url": body.media_url}
     if body.caption and body.media_type == "image":
@@ -5626,6 +5734,8 @@ async def send_whatsapp_media(body: WhatsAppMediaSendBody, actor: dict = Depends
         provider = await marketly_v2_request(body.media_type, settings, payload) if settings.get("marketly_bearer_token") else await whatsapp_service_request(
         "send", settings, data={"number": number, "type": "media", "message": body.caption or "", "media_url": body.media_url, "filename": body.filename}
         )
+    if provider.get("status") in {"provider_error", "pending_credentials", "pending_provider", "error", "failed"}:
+        raise HTTPException(status_code=502, detail=provider.get("message") or "WhatsApp provider could not send the attachment")
     now = now_utc().isoformat()
     msg = {
         "id": new_id(), "organization_id": lead.get("organization_id"), "conversation_id": conv["id"], "lead_id": lead["id"],
@@ -5656,7 +5766,31 @@ async def whatsapp_messages(conversation_id: str, user: dict = Depends(require_r
         raise HTTPException(status_code=404, detail="Conversation not found")
     if user.get("role") not in {"admin", "manager", "super_admin"} and conv.get("assigned_to") != user.get("id") and conv.get("whatsapp_account_user_id") != user.get("id"):
         raise HTTPException(status_code=403, detail="Conversation is not assigned to you")
-    return await db.whatsapp_messages.find({"conversation_id": conversation_id, **organization_scope(user)}, {"_id": 0}).sort("created_at", 1).to_list(500)
+    return await _list_whatsapp_messages(conv)
+
+
+@api.post("/whatsapp/conversations/{conversation_id}/messages")
+async def send_whatsapp_conversation_message(conversation_id: str, body: WhatsAppSendBody, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
+    conv, lead = await _whatsapp_conversation_context(conversation_id, actor)
+    return await create_whatsapp_message_for_lead(lead, body, actor, conversation=conv)
+
+
+@api.get("/whatsapp/messages/{message_id}/media")
+async def download_whatsapp_media(message_id: str, user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
+    message = await db.whatsapp_messages.find_one({"id": message_id}, {"_id": 0})
+    if not message:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    conv, _ = await _whatsapp_conversation_context(message["conversation_id"], user)
+    if message.get("organization_id") not in (None, conv["organization_id"]):
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    media = await db.whatsapp_media.find_one({"id": message_id, "organization_id": conv["organization_id"]}, {"_id": 0})
+    if not media:
+        raise HTTPException(status_code=404, detail="Attachment is no longer available")
+    filename = str(media.get("filename") or "attachment")
+    return Response(content=bytes(media["content"]), media_type=media.get("mimetype") or "application/octet-stream", headers={
+        "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(filename, safe='')}",
+        "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+    })
 
 
 @api.post("/whatsapp/conversations/{conversation_id}/attachments")
@@ -5666,14 +5800,8 @@ async def send_whatsapp_attachment(
     caption: str = Form(""),
     actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin")),
 ):
-    """Send an uploaded attachment through Evolution without storing it on Vercel."""
-    conv = await db.whatsapp_conversations.find_one({"id": conversation_id, **organization_scope(actor)}, {"_id": 0})
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    lead = await db.leads.find_one({"id": conv.get("lead_id"), **organization_scope(actor)}, {"_id": 0})
-    if not lead or not lead.get("phone"):
-        raise HTTPException(status_code=400, detail="A linked lead with a phone number is required to send an attachment")
-    await require_lead_access(lead["id"], actor)
+    """Send an attachment and retain its bytes in tenant-scoped storage."""
+    conv, lead = await _whatsapp_conversation_context(conversation_id, actor)
     return await _send_whatsapp_attachment(conv, lead, file, caption, actor)
 
 
@@ -5690,36 +5818,42 @@ async def send_lead_whatsapp_attachment(
 
 
 async def _send_whatsapp_attachment(conv: dict, lead: dict, file: UploadFile, caption: str, actor: dict) -> dict:
-    content = await file.read()
+    content = await file.read(WHATSAPP_ATTACHMENT_LIMIT + 1)
     if not content:
         raise HTTPException(status_code=400, detail="Choose a file to attach")
-    if len(content) > 16 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Attachments must be 16 MB or smaller")
-    settings = await whatsapp_settings_for_actor(lead.get("organization_id"), actor)
+    if len(content) > WHATSAPP_ATTACHMENT_LIMIT:
+        raise HTTPException(status_code=413, detail="Attachments must be 4 MB or smaller")
+    settings = await _whatsapp_settings_for_conversation(conv, actor)
     if settings.get("whatsapp_provider") != "evolution":
         raise HTTPException(status_code=400, detail="Attachments require the Evolution WhatsApp integration")
     instance = _evolution_instance(settings)
     if not instance:
         raise HTTPException(status_code=400, detail="Set an Evolution instance name for this organisation")
-    state = await evolution_request("GET", f"/instance/connectionState/{instance}", settings, timeout=25)
+    state = await evolution_request("GET", f"/instance/connectionState/{instance}", settings, timeout=10)
     if state.get("status") in {"provider_error", "pending_credentials"}:
         raise HTTPException(status_code=502, detail=state.get("message") or "Could not verify the WhatsApp connection")
     if _evolution_connection_state(state) not in {"open", "connected"}:
         raise HTTPException(status_code=409, detail="WhatsApp is disconnected. Reconnect the WhatsApp account and scan its QR code before sending attachments.")
     filename = file.filename or "attachment"
-    mime = (file.content_type or "application/octet-stream").split(";", 1)[0]
-    number = "".join(ch for ch in str(lead.get("phone")) if ch.isdigit())
+    mime = (file.content_type or "application/octet-stream").split(";", 1)[0].lower()
+    if mime in {"application/octet-stream", "binary/octet-stream"}:
+        mime = mimetypes.guess_type(filename)[0] or mime
+    number = str(conv.get("chat_id") or "").split("@", 1)[0] or "".join(ch for ch in str(lead.get("phone") or conv.get("contact_phone") or "") if ch.isdigit())
+    if not number:
+        raise HTTPException(status_code=400, detail="Contact has no WhatsApp phone number")
     encoded = base64.b64encode(content).decode("ascii")
     if mime.startswith("audio/"):
-        provider = await evolution_request("POST", f"/message/sendWhatsAppAudio/{instance}", settings, {"number": number, "audio": encoded}, timeout=90)
+        provider = await evolution_request("POST", f"/message/sendWhatsAppAudio/{instance}", settings, {"number": number, "audio": encoded}, timeout=35)
         message_type = "audio"
     else:
         message_type = "image" if mime.startswith("image/") else "video" if mime.startswith("video/") else "document"
-        provider = await evolution_request("POST", f"/message/sendMedia/{instance}", settings, {"number": number, "mediatype": message_type, "mimetype": mime, "media": encoded, "fileName": filename, "filename": filename, "caption": caption.strip()}, timeout=90)
-    if provider.get("status") in {"provider_error", "pending_credentials"}:
+        provider = await evolution_request("POST", f"/message/sendMedia/{instance}", settings, {"number": number, "mediatype": message_type, "mimetype": mime, "media": encoded, "fileName": filename, "filename": filename, "caption": caption.strip()}, timeout=35)
+    if provider.get("status") in {"provider_error", "pending_credentials", "error", "failed"}:
         raise HTTPException(status_code=502, detail=provider.get("message") or "WhatsApp provider could not send the attachment")
     now = now_utc().isoformat()
-    message = {"id": new_id(), "organization_id": lead.get("organization_id"), "conversation_id": conv["id"], "lead_id": lead["id"], "direction": "outgoing", "sender_id": actor["id"], "sender_name": actor.get("name"), "message_type": message_type, "text": caption.strip(), "filename": filename, "mimetype": mime, "provider_status": provider.get("status"), "provider_message_id": _evolution_provider_message_id(provider), "provider_response": provider, "created_at": now}
+    message = {"id": new_id(), "organization_id": conv["organization_id"], "conversation_id": conv["id"], "lead_id": lead.get("id"), "direction": "outgoing", "sender_id": actor["id"], "sender_name": actor.get("name"), "message_type": message_type, "text": caption.strip(), "filename": filename, "mimetype": mime, "provider_status": provider.get("status"), "provider_message_id": _evolution_provider_message_id(provider), "provider_response": _without_whatsapp_base64(provider), "created_at": now}
+    await _store_whatsapp_media(message, encoded)
+    message["whatsapp_account_user_id"] = conv.get("whatsapp_account_user_id")
     await db.whatsapp_messages.insert_one(message)
     await db.whatsapp_conversations.update_one({"id": conv["id"], "organization_id": lead.get("organization_id")}, {"$set": {"last_message": caption.strip() or f"[{filename}]", "last_message_at": now, "updated_at": now}})
     clean(message)
@@ -5734,8 +5868,26 @@ async def _send_whatsapp_attachment(conv: dict, lead: dict, file: UploadFile, ca
 async def whatsapp_webhook(request: Request, organization_id: Optional[str] = None, account_owner_id: Optional[str] = None):
     if request.method == "GET":
         return {"ok": True}
+    content_type = request.headers.get("content-type") or ""
+    payload = await request.json() if "application/json" in content_type else dict(await request.form())
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected a WhatsApp event object")
     if not organization_id:
-        raise HTTPException(status_code=400, detail="Organisation-specific WhatsApp webhook URL is required")
+        # Older provider configurations used the route without an org suffix.
+        # Resolve only a known, unambiguous instance; never choose an arbitrary tenant.
+        instance = payload.get("instance") or payload.get("instanceName")
+        matches = set()
+        if instance:
+            owners = await db.users.find({"whatsapp_evolution_instance": instance, "active": {"$ne": False}}, {"_id": 0, "id": 1, "organization_id": 1}).to_list(200)
+            matches.update((owner["organization_id"], owner["id"]) for owner in owners if owner.get("organization_id"))
+            organizations = await db.organizations.find({"active": {"$ne": False}}, {"_id": 0, "id": 1}).to_list(200)
+            for org in organizations:
+                settings = await get_integration_settings(org["id"])
+                if _evolution_instance(settings) == instance:
+                    matches.add((org["id"], None))
+        if len(matches) != 1:
+            raise HTTPException(status_code=400, detail="Use the organisation-specific webhook URL shown when connecting WhatsApp")
+        organization_id, account_owner_id = matches.pop()
     organization = await db.organizations.find_one({"id": organization_id, "active": {"$ne": False}}, {"_id": 0})
     if not organization:
         raise HTTPException(status_code=404, detail="Unknown organisation")
@@ -5744,16 +5896,20 @@ async def whatsapp_webhook(request: Request, organization_id: Optional[str] = No
         account_owner = await db.users.find_one({"id": account_owner_id, "organization_id": organization_id, "role": "executive", "active": {"$ne": False}}, {"_id": 0})
         if not account_owner:
             raise HTTPException(status_code=403, detail="Unknown executive WhatsApp account")
-    content_type = request.headers.get("content-type") or ""
-    if "application/json" in content_type:
-        payload = await request.json()
-    else:
-        payload = dict(await request.form())
-    event_name = str(payload.get("event") or payload.get("type") or "").upper() if isinstance(payload, dict) else ""
+    if isinstance(payload.get("data"), list):
+        results = [await _process_whatsapp_webhook({**payload, "data": item}, organization_id, account_owner_id) for item in payload["data"] if isinstance(item, dict)]
+        return {"ok": True, "processed": len(results)}
+    return await _process_whatsapp_webhook(payload, organization_id, account_owner_id)
+
+
+async def _process_whatsapp_webhook(payload: dict, organization_id: str, account_owner_id: Optional[str] = None):
+    event_name = re.sub(r"[.\-/]", "_", str(payload.get("event") or "").upper())
+    if event_name and event_name not in {"MESSAGES_UPSERT", "MESSAGES_UPDATE", "SEND_MESSAGE"}:
+        return {"ok": True, "ignored": "unsupported_event"}
     status_update = _evolution_message_status(payload)
     if event_name == "MESSAGES_UPDATE" and status_update:
         provider_message_id, provider_status = status_update
-        result = await db.whatsapp_messages.update_one(
+        result = await db.whatsapp_messages.update_many(
             {"organization_id": organization_id, "provider_message_id": provider_message_id},
             {"$set": {"provider_status": provider_status, "provider_status_updated_at": now_utc().isoformat()}},
         )
@@ -5764,8 +5920,8 @@ async def whatsapp_webhook(request: Request, organization_id: Optional[str] = No
     from_me = "true" if evolution_message and evolution_message["from_me"] else str(_first_payload_value(payload, ["fromMe", "from_me", "is_from_me"]) or "").lower()
     direction_hint = str(_first_payload_value(payload, ["direction", "event", "type"]) or "").lower()
     direction = "outgoing" if from_me in {"true", "1", "yes"} or "outgoing" in direction_hint else "incoming"
-    if direction != "incoming":
-        return {"ok": True, "ignored": "outgoing_status"}
+    if evolution_message and not evolution_message.get("phone"):
+        return {"ok": True, "ignored": "non_phone_chat"}
 
     phone_digits = "".join(ch for ch in str((evolution_message or {}).get("phone") or "") if ch.isdigit()) or _extract_whatsapp_phone(payload)
     if not phone_digits:
@@ -5775,16 +5931,18 @@ async def whatsapp_webhook(request: Request, organization_id: Optional[str] = No
     text = (evolution_message or {}).get("text") or _extract_whatsapp_text(payload)
     provider_message_id = (evolution_message or {}).get("message_id") or _extract_whatsapp_message_id(payload)
     if provider_message_id:
-        existing = await db.whatsapp_messages.find_one({"provider_message_id": provider_message_id}, {"_id": 0})
+        existing = await db.whatsapp_messages.find_one({"organization_id": organization_id, "whatsapp_account_user_id": account_owner_id, "provider_message_id": provider_message_id}, {"_id": 0})
         if existing:
             return {"ok": True, "duplicate": True}
 
     lead = await _find_lead_by_phone_digits(phone_digits, organization_id)
     now = now_utc().isoformat()
     conv_query = {"chat_id": chat_id, "organization_id": organization_id} if chat_id else None
-    if conv_query is not None and account_owner_id:
+    if conv_query is not None:
         conv_query["whatsapp_account_user_id"] = account_owner_id
     conv = await db.whatsapp_conversations.find_one(conv_query, {"_id": 0}) if conv_query else None
+    if not conv and lead:
+        conv = await db.whatsapp_conversations.find_one({"lead_id": lead["id"], "organization_id": organization_id, "whatsapp_account_user_id": account_owner_id}, {"_id": 0})
     if not conv:
         conv = {
             "id": new_id(),
@@ -5808,7 +5966,8 @@ async def whatsapp_webhook(request: Request, organization_id: Optional[str] = No
         "organization_id": organization_id,
         "conversation_id": conv["id"],
         "lead_id": (lead or {}).get("id") or conv.get("lead_id"),
-        "direction": "incoming",
+        "direction": direction,
+        "whatsapp_account_user_id": account_owner_id,
         "sender_id": None,
         "sender_name": conv.get("contact_name") or phone_digits,
         "message_type": (evolution_message or {}).get("message_type") or "text",
@@ -5817,17 +5976,23 @@ async def whatsapp_webhook(request: Request, organization_id: Optional[str] = No
         "filename": (evolution_message or {}).get("filename"),
         "mimetype": (evolution_message or {}).get("mimetype"),
         "provider_message_id": provider_message_id,
-        "provider_status": "received",
-        "provider_response": evolution_message.get("payload") if evolution_message else payload,
+        "provider_status": "sent" if direction == "outgoing" else "received",
+        "provider_response": _without_whatsapp_base64(evolution_message.get("payload") if evolution_message else payload),
         "created_at": _extract_whatsapp_timestamp((evolution_message or {}).get("payload") or payload) if evolution_message else now,
     }
+    if evolution_message and evolution_message.get("message_type") != "text":
+        settings = await get_integration_settings(organization_id)
+        if account_owner_id:
+            owner = await db.users.find_one({"id": account_owner_id, "organization_id": organization_id}, {"_id": 0})
+            settings["_evolution_instance_override"] = (owner or {}).get("whatsapp_evolution_instance")
+        await _receive_whatsapp_media(msg, evolution_message, settings)
     await db.whatsapp_messages.insert_one(msg)
     await db.whatsapp_conversations.update_one(
         {"id": conv["id"], "organization_id": organization_id},
-        {"$set": {"last_message": text, "last_message_at": now, "updated_at": now, "lead_id": msg.get("lead_id"), "assigned_to": account_owner_id or (lead or {}).get("assigned_to") or conv.get("assigned_to"), "whatsapp_account_user_id": account_owner_id or conv.get("whatsapp_account_user_id")}, "$inc": {"unread_count": 1}},
+        {"$set": {"last_message": text, "last_message_at": now, "updated_at": now, "lead_id": msg.get("lead_id"), "assigned_to": account_owner_id or (lead or {}).get("assigned_to") or conv.get("assigned_to"), "whatsapp_account_user_id": account_owner_id or conv.get("whatsapp_account_user_id")}, "$inc": {"unread_count": 1 if direction == "incoming" else 0}},
     )
-    if lead:
-        await log_activity(lead["id"], {"name": "WhatsApp"}, "whatsapp", f"Incoming WhatsApp: {text[:160]}", {"conversation_id": conv["id"], "direction": "incoming"})
+    if lead and direction == "incoming":
+        await log_activity(lead["id"], {"name": "WhatsApp", "organization_id": organization_id}, "whatsapp", f"Incoming WhatsApp: {text[:160]}", {"conversation_id": conv["id"], "direction": "incoming"})
     return {"ok": True, "conversation_id": conv["id"], "lead_id": msg.get("lead_id")}
 
 
@@ -5835,7 +6000,7 @@ async def whatsapp_webhook(request: Request, organization_id: Optional[str] = No
 async def lead_whatsapp(lead_id: str, user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     lead = await require_lead_access(lead_id, user)
     conv = await ensure_whatsapp_conversation_for_lead(lead, user)
-    messages = await db.whatsapp_messages.find({"conversation_id": conv["id"]}, {"_id": 0}).sort("created_at", 1).to_list(500)
+    messages = await _list_whatsapp_messages(conv)
     return {"conversation": sanitize_whatsapp_conversation(conv, user), "messages": messages}
 
 
