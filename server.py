@@ -4361,12 +4361,11 @@ def _with_env_integration_defaults(settings: Optional[dict]) -> dict:
         # The current rollout uses one shared CallerDesk account. Its Vercel
         # credentials must override stale per-organisation values until each
         # organisation has its own confirmed CallerDesk account configuration.
-        # Evolution is deployed as a single server integration, just like the
-        # working WhatsApp reference.  Do not let an old organisation record
-        # silently replace the live API URL, API key, or shared instance.
+        # The API server credentials are deployment-wide; a confirmed instance
+        # name belongs to the organisation and must survive environment defaults.
         if key in {
             "callerdesk_authcode", "callerdesk_virtual_number",
-            "evolution_api_url", "evolution_api_key", "evolution_instance_name",
+            "evolution_api_url", "evolution_api_key",
         } or not merged.get(key):
             merged[key] = value
     if defaults.get("evolution_api_url") and defaults.get("evolution_api_key"):
@@ -4805,15 +4804,17 @@ def _first_payload_value(payload, keys: list[str]) -> Optional[str]:
     return None
 
 
-async def _persist_whatsapp_instance(settings: dict, instance: dict) -> Optional[str]:
+async def _persist_whatsapp_instance(organization_id: Optional[str], settings: dict, instance: dict) -> Optional[str]:
     instance_id = _first_payload_value(instance, ["instance_id", "instanceId", "token", "id"])
     if not instance_id:
         return None
     instance_id = str(instance_id)
     settings["whatsapp_instance_id"] = instance_id
+    if not organization_id:
+        return instance_id
     await db.settings.update_one(
-        {"id": "singleton"},
-        {"$set": {"whatsapp_instance_id": instance_id, "updated_at": now_utc().isoformat()}},
+        {"id": f"organization:{organization_id}"},
+        {"$set": {"organization_id": organization_id, "whatsapp_instance_id": instance_id, "updated_at": now_utc().isoformat()}},
         upsert=True,
     )
     return instance_id
@@ -4992,7 +4993,7 @@ async def _find_lead_by_phone_digits(phone_digits: str, organization_id: Optiona
 async def whatsapp_service_request(endpoint: str, settings: dict, params: Optional[dict] = None, data: Optional[dict] = None) -> dict:
     service_url = (settings.get("whatsapp_service_url") or "").rstrip("/")
     access_token = settings.get("whatsapp_access_token")
-    instance_id = settings.get("whatsapp_instance_id") or settings.get("whatsapp_number")
+    instance_id = None if endpoint == "create_instance" else settings.get("whatsapp_instance_id") or settings.get("whatsapp_number")
     if not service_url or not access_token:
         return {"status": "pending_credentials", "message": "WhatsApp service URL/access token is not configured"}
     provider_endpoint = {
@@ -5040,7 +5041,13 @@ async def whatsapp_service_request(endpoint: str, settings: dict, params: Option
             )
         with urllib.request.urlopen(req, timeout=20) as resp:
             raw = resp.read().decode("utf-8")
-        return json.loads(raw) if raw else {"status": "success"}
+        try:
+            result = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            return {"status": "provider_error", "message": "WHATSAPP_SERVICE_URL returned a web page instead of API JSON. Set it to your provider's WhatsApp API address; changing the instance ID will not fix this."}
+        if not isinstance(result, dict) or not result:
+            return {"status": "provider_error", "message": "WhatsApp provider returned an empty or invalid API response"}
+        return result
 
     try:
         return await asyncio.to_thread(_call)
@@ -5155,11 +5162,14 @@ def _evolution_instance(settings: dict) -> str:
     personal_instance = str(settings.get("_evolution_instance_override") or "").strip()
     if personal_instance:
         return personal_instance
+    configured = str(settings.get("evolution_instance_name") or settings.get("whatsapp_instance_id") or "").strip()
+    if configured:
+        return configured
     organization_id = str(settings.get("organization_id") or "").strip()
     if organization_id:
         prefix = re.sub(r"[^a-z0-9]", "", os.environ.get("EVOLUTION_INSTANCE_NAME", "rrl").lower())[:18] or "rrl"
         return f"{prefix}_{re.sub(r'[^a-z0-9]', '', organization_id.lower())[:16]}"
-    return str(settings.get("evolution_instance_name") or settings.get("whatsapp_instance_id") or "").strip()
+    return ""
 
 
 def _executive_evolution_instance(actor: dict, organization_id: Optional[str]) -> str:
@@ -5448,6 +5458,32 @@ async def whatsapp_status(user: dict = Depends(require_roles("admin", "manager",
     }
 
 
+def _whatsapp_provider_failed(response) -> bool:
+    return not isinstance(response, dict) or not response or response.get("status") is False or str(response.get("status") or "").lower() in {
+        "provider_error", "error", "failed", "pending_credentials", "pending_provider",
+    } or response.get("success") is False
+
+
+def _check_whatsapp_provider_response(response, fallback: str):
+    if _whatsapp_provider_failed(response):
+        detail = response.get("message") or response.get("error") if isinstance(response, dict) else None
+        raise HTTPException(status_code=502, detail=detail or fallback)
+
+
+def _whatsapp_instance_expired(response: dict) -> bool:
+    message = str(response.get("message") or response.get("error") or "")
+    return response.get("relogin") is True or bool(re.search(
+        r"(?:instance|session).*(?:invalid|expired|not found|used)|(?:invalid|expired|not found).*(?:instance|session)", message, re.I,
+    ))
+
+
+def _organization_whatsapp_webhook(organization_id: str) -> str:
+    base = _whatsapp_webhook_url().rstrip("/")
+    if not base:
+        raise HTTPException(status_code=400, detail="Set BACKEND_PUBLIC_URL before connecting WhatsApp")
+    return base if base.endswith(f"/{organization_id}") else f"{base}/{organization_id}"
+
+
 @api.post("/whatsapp/connect")
 async def whatsapp_connect(actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     organization_id = organization_scope(actor).get("organization_id")
@@ -5482,11 +5518,9 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin", "manager
         return {"status": "pending_credentials", "message": "Configure WhatsApp service URL/access token before connecting"}
     instance = None
     current = await whatsapp_service_request("instance", settings) if settings.get("whatsapp_instance_id") else None
-    current_message = str((current or {}).get("message") or (current or {}).get("error") or "") if isinstance(current, dict) else ""
-    disconnected = isinstance(current, dict) and (
-        current.get("relogin") is True
-        or re.search(r"disconnected|invalid|expired|not found|used", current_message, re.I)
-    )
+    disconnected = isinstance(current, dict) and _whatsapp_instance_expired(current)
+    if current is not None and not disconnected:
+        _check_whatsapp_provider_response(current, "Could not check the WhatsApp instance")
     if not settings.get("whatsapp_instance_id") or disconnected:
         # The reference module creates a new pending session only when the
         # current instance cannot be reused.  Do not pass the stale ID to the
@@ -5494,15 +5528,18 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin", "manager
         create_settings = dict(settings)
         create_settings.pop("whatsapp_instance_id", None)
         instance = await whatsapp_service_request("create_instance", create_settings)
-        await _persist_whatsapp_instance(settings, instance)
+        _check_whatsapp_provider_response(instance, "Could not create the WhatsApp instance")
+        if not await _persist_whatsapp_instance(organization_id, settings, instance):
+            raise HTTPException(status_code=502, detail="WhatsApp provider did not return a new instance ID")
     webhook = None
-    webhook_url = _whatsapp_webhook_url()
+    webhook_url = _organization_whatsapp_webhook(organization_id)
     if webhook_url:
         webhook = await whatsapp_service_request(
             "set_webhook",
             settings,
             params={"webhook_url": webhook_url, "enable": "true"},
         )
+        _check_whatsapp_provider_response(webhook, "Could not register the WhatsApp receiving webhook")
     return {"status": "ready", "instance_id": settings.get("whatsapp_instance_id"), "connect_url": f"{settings['whatsapp_service_url'].rstrip('/')}/create_instance", "provider": instance, "webhook": webhook}
 
 
@@ -5559,6 +5596,8 @@ async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin", "manager"
         return result
     result = await whatsapp_service_request("get_qrcode", settings)
     message = str(result.get("message") or result.get("error") or "") if isinstance(result, dict) else ""
+    if re.search(r"already connected", message, re.I):
+        return {"status": "connected", "connection_state": "open", "message": message}
     if re.search(r"instance.?id.*(used|expired|invalid)|already connected|not found", message, re.I):
         # Marketly requires a new instance for a fresh WhatsApp Web scan.
         # Create it only after the configured instance is rejected, then retry
@@ -5566,15 +5605,18 @@ async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin", "manager"
         create_settings = dict(settings)
         create_settings.pop("whatsapp_instance_id", None)
         fresh_instance = await whatsapp_service_request("create_instance", create_settings)
-        if await _persist_whatsapp_instance(settings, fresh_instance):
-            webhook_url = _whatsapp_webhook_url()
+        _check_whatsapp_provider_response(fresh_instance, "Could not create the WhatsApp instance")
+        if await _persist_whatsapp_instance(organization_scope(actor).get("organization_id"), settings, fresh_instance):
+            webhook_url = _organization_whatsapp_webhook(organization_scope(actor).get("organization_id"))
             if webhook_url:
-                await whatsapp_service_request(
+                webhook = await whatsapp_service_request(
                     "set_webhook",
                     settings,
                     params={"webhook_url": webhook_url, "enable": "true"},
                 )
+                _check_whatsapp_provider_response(webhook, "Could not register the WhatsApp receiving webhook")
             result = await whatsapp_service_request("get_qrcode", settings)
+    _check_whatsapp_provider_response(result, "Could not load the WhatsApp QR code")
     if isinstance(result, dict):
         # Marketly's profile page returns the QR as `base64`; Taskko's UI also
         # accepts `qrcode`/`qr_code`, so normalize the common provider shape.
