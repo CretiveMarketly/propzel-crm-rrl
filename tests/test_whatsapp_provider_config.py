@@ -109,3 +109,43 @@ def test_already_connected_qr_does_not_replace_paired_instance(monkeypatch):
     result = asyncio.run(server.whatsapp_qrcode(ACTOR))
     assert result["connection_state"] == "open"
     assert provider.await_count == 1
+
+
+@pytest.mark.parametrize("defaults", [
+    {"whatsapp_provider": "evolution"},
+    {"evolution_api_url": "https://evolution.example"},
+    {"evolution_api_key": "key"},
+])
+def test_incomplete_evolution_config_never_falls_back_to_marketly(monkeypatch, defaults):
+    monkeypatch.setattr(server, "_env_integration_defaults", lambda: defaults)
+    result = server._with_env_integration_defaults(legacy_settings())
+    assert result["whatsapp_provider"] == "evolution"
+
+
+def test_stored_evolution_credentials_override_stale_provider(monkeypatch):
+    monkeypatch.setattr(server, "_env_integration_defaults", lambda: {})
+    result = server._with_env_integration_defaults({**legacy_settings(), "evolution_api_url": "https://evolution.example", "evolution_api_key": "key"})
+    assert result["whatsapp_provider"] == "evolution"
+
+
+def test_propzel_defaults_to_evolution(monkeypatch):
+    monkeypatch.delenv("WHATSAPP_PROVIDER", raising=False)
+    assert server._env_integration_defaults()["whatsapp_provider"] == "evolution"
+
+
+def test_evolution_does_not_reuse_marketly_instance_id(monkeypatch):
+    monkeypatch.delenv("EVOLUTION_INSTANCE_NAME", raising=False)
+    settings = {**legacy_settings(), "whatsapp_provider": "evolution"}
+    assert server._evolution_instance(settings) == "rrl_propzel"
+
+
+def test_missing_evolution_key_does_not_call_legacy_provider(monkeypatch):
+    settings = {**legacy_settings(), "whatsapp_provider": "evolution", "evolution_api_url": "https://evolution.example"}
+    monkeypatch.setattr(server, "whatsapp_settings_for_actor", AsyncMock(return_value=settings))
+    legacy = AsyncMock()
+    monkeypatch.setattr(server, "whatsapp_service_request", legacy)
+    result = asyncio.run(server.whatsapp_profile(ACTOR))
+    assert result["provider"] == "evolution"
+    assert result["connection_state"] == "unknown"
+    assert "EVOLUTION_API_KEY" in result["connection_error"]
+    legacy.assert_not_awaited()

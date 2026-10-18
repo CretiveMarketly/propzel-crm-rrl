@@ -4335,7 +4335,7 @@ async def analytics_summary(project_id: Optional[str] = None, user: dict = Depen
 # ---------------------------------------------------------------------------
 def _env_integration_defaults() -> dict:
     defaults = {
-        "whatsapp_provider": os.environ.get("WHATSAPP_PROVIDER", "").strip(),
+        "whatsapp_provider": os.environ.get("WHATSAPP_PROVIDER", "evolution").strip(),
         "whatsapp_service_url": os.environ.get("WHATSAPP_SERVICE_URL", "").strip(),
         "whatsapp_access_token": os.environ.get("WHATSAPP_ACCESS_TOKEN", "").strip(),
         "whatsapp_instance_id": os.environ.get("WHATSAPP_INSTANCE_ID", "").strip(),
@@ -4368,7 +4368,14 @@ def _with_env_integration_defaults(settings: Optional[dict]) -> dict:
             "evolution_api_url", "evolution_api_key",
         } or not merged.get(key):
             merged[key] = value
-    if defaults.get("evolution_api_url") and defaults.get("evolution_api_key"):
+    # Propzel uses Evolution. Keep that selection even when a deployment
+    # credential is missing; stale Marketly settings must not become a fallback.
+    if (
+        defaults.get("whatsapp_provider") == "evolution"
+        or merged.get("whatsapp_provider") == "evolution"
+        or merged.get("evolution_api_url")
+        or merged.get("evolution_api_key")
+    ):
         merged["whatsapp_provider"] = "evolution"
         merged.setdefault("whatsapp_enabled", True)
     elif defaults.get("whatsapp_service_url") and defaults.get("whatsapp_access_token"):
@@ -5162,7 +5169,9 @@ def _evolution_instance(settings: dict) -> str:
     personal_instance = str(settings.get("_evolution_instance_override") or "").strip()
     if personal_instance:
         return personal_instance
-    configured = str(settings.get("evolution_instance_name") or settings.get("whatsapp_instance_id") or "").strip()
+    # A legacy Marketly instance ID does not identify an Evolution session.
+    legacy_instance = settings.get("whatsapp_instance_id") if settings.get("whatsapp_provider") != "evolution" else None
+    configured = str(settings.get("evolution_instance_name") or legacy_instance or "").strip()
     if configured:
         return configured
     organization_id = str(settings.get("organization_id") or "").strip()
@@ -5212,7 +5221,8 @@ async def evolution_request(method: str, path: str, settings: dict, payload: Opt
     base_url = str(settings.get("evolution_api_url") or "").rstrip("/")
     api_key = settings.get("evolution_api_key")
     if not base_url or not api_key:
-        return {"status": "pending_credentials", "message": "Evolution API is not configured on the server"}
+        missing = [name for name, value in (("EVOLUTION_API_URL", base_url), ("EVOLUTION_API_KEY", api_key)) if not value]
+        return {"status": "pending_credentials", "message": "Configure " + ", ".join(missing) + " on the backend deployment and redeploy"}
 
     def _call() -> dict:
         request = urllib.request.Request(
