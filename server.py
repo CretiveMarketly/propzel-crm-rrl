@@ -2789,11 +2789,8 @@ def decode_token(token: str) -> dict:
 
 
 async def get_current_user(request: Request) -> dict:
-    token = request.cookies.get("access_token")
-    if not token:
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            token = auth[7:]
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else request.cookies.get("access_token")
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
@@ -2807,6 +2804,8 @@ async def get_current_user(request: Request) -> dict:
     user = await db.users.find_one({"id": payload["sub"]}, {"password_hash": 0})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    if user.get("active") is False:
+        raise HTTPException(status_code=403, detail="Account is disabled")
     user.pop("_id", None)
     requested_organization_id = request.headers.get("X-Organization-Id", "").strip()
     if user.get("role") == "super_admin":
@@ -3238,9 +3237,15 @@ async def me(user: dict = Depends(get_current_user)):
     return sanitize_contact_doc(user, user)
 
 
+class RefreshTokenBody(BaseModel):
+    refresh_token: Optional[str] = None
+
+
 @api.post("/auth/refresh")
-async def refresh(request: Request, response: Response):
-    tok = request.cookies.get("refresh_token")
+async def refresh(request: Request, response: Response, body: Optional[RefreshTokenBody] = None):
+    # Separate Vercel frontend/backend domains can block third-party cookies.
+    # The login response already supplies a refresh token to the browser.
+    tok = (body.refresh_token if body else None) or request.cookies.get("refresh_token")
     if not tok:
         raise HTTPException(status_code=401, detail="No refresh token")
     try:
@@ -3252,6 +3257,8 @@ async def refresh(request: Request, response: Response):
     user = await db.users.find_one({"id": payload["sub"]}, {"password_hash": 0})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    if user.get("active") is False:
+        raise HTTPException(status_code=403, detail="Account is disabled")
     tokens = set_auth_cookies(response, user["id"], user["email"], user["role"])
     return {**sanitize_contact_doc(clean(user), user), **tokens}
 
@@ -5209,7 +5216,7 @@ async def evolution_request(method: str, path: str, settings: dict, payload: Opt
         try:
             return json.loads(raw) if raw else {"status": "success"}
         except json.JSONDecodeError:
-            return {"status": "success", "raw": raw}
+            return {"status": "provider_error", "message": "Evolution API returned an unexpected response. Check EVOLUTION_API_URL and that the provider is reachable."}
 
     try:
         result = await asyncio.to_thread(_call)
@@ -5456,16 +5463,16 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin", "manager
             instance = _evolution_instance(settings)
         if not instance:
             raise HTTPException(status_code=400, detail="Set an Evolution instance name for this organisation")
-        state = await evolution_request("GET", f"/instance/connectionState/{instance}", settings)
+        state = await evolution_request("GET", f"/instance/connectionState/{instance}", settings, timeout=10)
         if state.get("http_status") == 404:
-            state = await evolution_request("POST", "/instance/create", settings, {"instanceName": instance, "integration": "WHATSAPP-BAILEYS", "qrcode": True})
-        if state.get("status") == "provider_error":
+            state = await evolution_request("POST", "/instance/create", settings, {"instanceName": instance, "integration": "WHATSAPP-BAILEYS", "qrcode": True}, timeout=15)
+        if state.get("status") in {"provider_error", "pending_credentials", "error", "failed"}:
             raise HTTPException(status_code=502, detail=state.get("message") or "Could not prepare the WhatsApp connection")
         webhook_path = f"{organization_id}/{actor['id']}" if personal_executive_account else str(organization_id or "")
         webhook_url = f"{_whatsapp_webhook_url().rstrip('/')}/{webhook_path}" if _whatsapp_webhook_url() and webhook_path else ""
         if not webhook_url:
             raise HTTPException(status_code=400, detail="Set BACKEND_PUBLIC_URL to the public backend address before connecting WhatsApp")
-        webhook = await evolution_request("POST", f"/webhook/set/{instance}", settings, {"webhook": {"enabled": True, "url": webhook_url, "webhook_by_events": False, "webhook_base64": False, "events": ["MESSAGES_UPSERT", "MESSAGES_UPDATE"]}})
+        webhook = await evolution_request("POST", f"/webhook/set/{instance}", settings, {"webhook": {"enabled": True, "url": webhook_url, "webhook_by_events": False, "webhook_base64": False, "events": ["MESSAGES_UPSERT", "MESSAGES_UPDATE"]}}, timeout=15)
         if webhook.get("status") in {"provider_error", "pending_credentials", "error", "failed"}:
             raise HTTPException(status_code=502, detail=webhook.get("message") or "Could not register the WhatsApp receiving webhook")
         if personal_executive_account:
@@ -5503,13 +5510,14 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin", "manager
 async def whatsapp_profile(user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     settings = await whatsapp_settings_for_actor(organization_scope(user).get("organization_id"), user)
     instance = _evolution_instance(settings)
-    provider = await evolution_request("GET", f"/instance/connectionState/{instance}", settings) if settings.get("whatsapp_provider") == "evolution" and instance else await whatsapp_service_request("instance", settings)
+    provider = await evolution_request("GET", f"/instance/connectionState/{instance}", settings, timeout=10) if settings.get("whatsapp_provider") == "evolution" and instance else await whatsapp_service_request("instance", settings)
     profile = {
         "provider": settings.get("whatsapp_provider") or "pending",
         "configured": bool(settings.get("evolution_api_url") and settings.get("evolution_api_key")) if settings.get("whatsapp_provider") == "evolution" else bool(settings.get("whatsapp_service_url") and settings.get("whatsapp_access_token")),
         "phone": None if user.get("role") == "executive" else settings.get("whatsapp_number"),
         "instance_id": instance,
         "connection_state": _evolution_connection_state(provider) if settings.get("whatsapp_provider") == "evolution" else str(provider.get("status") or "unknown").lower(),
+        "connection_error": provider.get("message") if provider.get("status") in {"provider_error", "pending_credentials", "error", "failed"} else None,
         "service_url": settings.get("evolution_api_url") if user.get("role") == "super_admin" and settings.get("whatsapp_provider") == "evolution" else settings.get("whatsapp_service_url") if user.get("role") == "super_admin" else None,
         "provider_response": provider,
     }
@@ -5538,7 +5546,9 @@ async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin", "manager"
         instance = _evolution_instance(settings)
         if not instance:
             raise HTTPException(status_code=400, detail="Set an Evolution instance name for this organisation")
-        result = await evolution_request("GET", f"/instance/connect/{instance}", settings)
+        result = await evolution_request("GET", f"/instance/connect/{instance}", settings, timeout=25)
+        if result.get("status") in {"provider_error", "pending_credentials", "error", "failed"}:
+            raise HTTPException(status_code=502, detail=result.get("message") or "Could not load the WhatsApp QR code")
         # Evolution returns the scan image as `base64`; preserve the provider
         # response but expose the existing CRM UI's expected field as well.
         if isinstance(result, dict) and not result.get("qrcode"):
