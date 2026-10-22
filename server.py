@@ -6178,8 +6178,8 @@ async def import_leads(body: ImportBody, actor: dict = Depends(require_roles("ad
 
     created, failed = 0, 0
     # Keep requests and Mongo writes bounded for Vercel/serverless execution.
-    for start in range(0, len(docs), 100):
-        batch = docs[start:start + 100]
+    for start in range(0, len(docs), 500):
+        batch = docs[start:start + 500]
         try:
             await db.leads.insert_many(batch, ordered=False)
             created += len(batch)
@@ -6190,7 +6190,7 @@ async def import_leads(body: ImportBody, actor: dict = Depends(require_roles("ad
         # Importing leads is the primary transaction. Audit insertion must not
         # turn a successful import into an apparent failure for the user.
         try:
-            await db.activities.insert_many(activities[start:start + 100], ordered=False)
+            await db.activities.insert_many(activities[start:start + 500], ordered=False)
         except Exception as exc:
             log.warning("CSV import activity logging failed for organisation %s: %s", organization_id, exc)
     return {"created": created, "failed": failed, "date_warnings": date_warnings}
