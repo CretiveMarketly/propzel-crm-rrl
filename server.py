@@ -3714,6 +3714,9 @@ async def list_leads(
     owner_mode: Literal["any", "primary", "co_owner"] = "any",
     source: Optional[str] = None,
     search: Optional[str] = None,
+    created_after: Optional[str] = None,
+    page: Optional[int] = Query(None, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
     user: dict = Depends(get_current_user),
 ):
     clauses: list[dict] = [organization_scope(user)]
@@ -3731,6 +3734,8 @@ async def list_leads(
             clauses.append({"$or": [{"assigned_to": assigned_to}, {"co_assigned_to": assigned_to}]})
     if source:
         clauses.append({"source": source})
+    if created_after:
+        clauses.append({"created_at": {"$gte": created_after}})
     if search:
         clauses.append({"$or": [
             {"name": {"$regex": search, "$options": "i"}},
@@ -3741,8 +3746,17 @@ async def list_leads(
     if user["role"] in {"manager", "executive", "sales"}:
         clauses.append({"$or": [{"assigned_to": user["id"]}, {"co_assigned_to": user["id"]}]})
     q = {} if not clauses else (clauses[0] if len(clauses) == 1 else {"$and": clauses})
-    docs = await db.leads.find(q, {"_id": 0}).sort("created_at", -1).to_list(2000)
-    return sanitize_many(docs, user)
+    cursor = db.leads.find(q, {"_id": 0}).sort([("created_at", -1), ("id", -1)])
+    # Existing API clients keep the array response. The Leads page requests
+    # bounded pages and a true total instead of downloading 2,000 cards at once.
+    if page is None:
+        docs = await cursor.limit(2000).to_list(2000)
+        return sanitize_many(docs, user)
+    total, docs = await asyncio.gather(
+        db.leads.count_documents(q),
+        cursor.skip((page - 1) * page_size).limit(page_size).to_list(page_size),
+    )
+    return {"items": sanitize_many(docs, user), "total": total, "page": page, "page_size": page_size}
 
 
 @api.get("/leads/{lead_id}")
@@ -8846,6 +8860,7 @@ async def on_startup():
         await asyncio.gather(
             db.users.create_index("email", unique=True),
             db.leads.create_index("stage"),
+            db.leads.create_index([("organization_id", 1), ("created_at", -1), ("id", -1)]),
             db.leads.create_index("assigned_to"),
             db.leads.create_index("project_id"),
             db.units.create_index([("project_id", 1), ("tower", 1), ("floor", 1)]),
